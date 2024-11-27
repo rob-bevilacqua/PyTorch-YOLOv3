@@ -312,6 +312,79 @@ def non_max_suppression(prediction, conf_thres=0.25, iou_thres=0.45, classes=Non
     nc = prediction.shape[2] - 5  # number of classes
 
     # Settings
+    max_wh = 4096  # max width-height offset
+    max_det = 300  # maximum number of detections per image
+    max_nms = 30000  # maximum number of boxes into torchvision.ops.nms()
+    time_limit = 1.0  # seconds to quit after
+    multi_label = nc > 1  # multiple labels per box
+
+    t = time.time()
+    output = [torch.zeros((0, 6), device="cpu")] * prediction.shape[0]
+
+    for xi, x in enumerate(prediction):  # image index, image inference
+        x = x[x[..., 4] > conf_thres]  # confidence threshold
+
+        # If no boxes remain, skip
+        if not x.shape[0]:
+            continue
+
+        # Compute confidence
+        x[:, 5:] *= x[:, 4:5]  # conf = obj_conf * cls_conf
+
+        # Convert (center x, y, width, height) to (x1, y1, x2, y2)
+        box = xywh2xyxy(x[:, :4])
+
+        # Detections matrix
+        if multi_label:
+            i, j = (x[:, 5:] > conf_thres).nonzero(as_tuple=False).T
+            x = torch.cat((box[i], x[i, j + 5, None], j[:, None].float()), 1)
+        else:  # Best class only
+            conf, j = x[:, 5:].max(1, keepdim=True)
+            x = torch.cat((box, conf, j.float()), 1)[conf.view(-1) > conf_thres]
+
+        # Filter by class
+        if classes is not None:
+            x = x[(x[:, 5:6] == torch.tensor(classes, device=x.device)).any(1)]
+
+        # Limit number of boxes
+        n = x.shape[0]
+        if not n:
+            continue
+        elif n > max_nms:
+            x = x[x[:, 4].argsort(descending=True)[:max_nms]]
+
+        # Debugging: Log tensor shapes and devices
+        print(f"Boxes device: {x[:, :4].device}, shape: {x[:, :4].shape}")
+        print(f"Scores device: {x[:, 4].device}, shape: {x[:, 4].shape}")
+
+        # Batched NMS
+        boxes, scores = x[:, :4], x[:, 4]
+        boxes = boxes.to("cpu")  # Force NMS on CPU if needed
+        scores = scores.to("cpu")
+        i = torchvision.ops.nms(boxes, scores, iou_thres)
+
+        if i.shape[0] > max_det:
+            i = i[:max_det]
+
+        output[xi] = to_cpu(x[i])
+
+        # Debugging: Check memory usage
+        print(f"Memory allocated: {torch.cuda.memory_allocated() / 1e6} MB")
+        print(f"Memory reserved: {torch.cuda.memory_reserved() / 1e6} MB")
+
+        if (time.time() - t) > time_limit:
+            print(f"WARNING: NMS time limit {time_limit}s exceeded")
+            break
+
+    return output
+    """Performs Non-Maximum Suppression (NMS) on inference results
+    Returns:
+         detections with shape: nx6 (x1, y1, x2, y2, conf, cls)
+    """
+
+    nc = prediction.shape[2] - 5  # number of classes
+
+    # Settings
     # (pixels) minimum and maximum box width and height
     max_wh = 4096
     max_det = 300  # maximum number of detections per image
@@ -320,7 +393,7 @@ def non_max_suppression(prediction, conf_thres=0.25, iou_thres=0.45, classes=Non
     multi_label = nc > 1  # multiple labels per box (adds 0.5ms/img)
 
     t = time.time()
-    output = [torch.zeros((0, 6), device="cpu")] * prediction.shape[0]
+    output = [torch.zeros((0, 6), device="cuda")] * prediction.shape[0]
 
     for xi, x in enumerate(prediction):  # image index, image inference
         # Apply constraints

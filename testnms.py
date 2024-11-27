@@ -1,13 +1,13 @@
 import torch
 import torchvision
 
-# Dummy data
-boxes = torch.tensor([[0, 0, 1, 1], [0, 0, 1, 1]], dtype=torch.float32).to("cuda")
-scores = torch.tensor([0.9, 0.8], dtype=torch.float32).to("cuda")
-iou_threshold = 0.5
+# Test NMS with dummy data
+boxes = torch.tensor([[0, 0, 10, 10], [5, 5, 15, 15], [10, 10, 20, 20]], dtype=torch.float32)
+scores = torch.tensor([0.9, 0.8, 0.7], dtype=torch.float32)
 
 try:
-    kept_indices = torchvision.ops.nms(boxes, scores, iou_threshold)
-    print("NMS ran successfully on CUDA!")
+    indices = torchvision.ops.nms(boxes, scores, 0.5)
+    print(f"NMS indices: {indices}")
 except Exception as e:
-    print("NMS failed:", e)
+    print(f"NMS failed: {e}")
+

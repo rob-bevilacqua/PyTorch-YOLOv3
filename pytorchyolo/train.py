@@ -1,7 +1,4 @@
 #! /usr/bin/env python3
-# to train py -3.11 pytorchyolo/train.py --model config/yolov3-custom.cfg --data config/custom.data
-
-#! /usr/bin/env python3
 
 from __future__ import division
 
@@ -12,23 +9,38 @@ import tqdm
 import torch
 from torch.utils.data import DataLoader
 import torch.optim as optim
-from torch.cuda.amp import GradScaler, autocast  # For mixed precision training
 
 from pytorchyolo.models import load_model
 from pytorchyolo.utils.logger import Logger
 from pytorchyolo.utils.utils import to_cpu, load_classes, print_environment_info, provide_determinism, worker_seed_set
 from pytorchyolo.utils.datasets import ListDataset
 from pytorchyolo.utils.augmentations import AUGMENTATION_TRANSFORMS
+#from pytorchyolo.utils.transforms import DEFAULT_TRANSFORMS
 from pytorchyolo.utils.parse_config import parse_data_config
 from pytorchyolo.utils.loss import compute_loss
 from pytorchyolo.test import _evaluate, _create_validation_data_loader
 
 from terminaltables import AsciiTable
+
 from torchsummary import summary
 
 
 def _create_data_loader(img_path, batch_size, img_size, n_cpu, multiscale_training=False):
-    """Creates a DataLoader for training."""
+    """Creates a DataLoader for training.
+
+    :param img_path: Path to file containing all paths to training images.
+    :type img_path: str
+    :param batch_size: Size of each image batch
+    :type batch_size: int
+    :param img_size: Size of each image dimension for yolo
+    :type img_size: int
+    :param n_cpu: Number of cpu threads to use during batch generation
+    :type n_cpu: int
+    :param multiscale_training: Scale images to different sizes randomly
+    :type multiscale_training: bool
+    :return: Returns DataLoader
+    :rtype: DataLoader
+    """
     dataset = ListDataset(
         img_path,
         img_size=img_size,
@@ -61,7 +73,7 @@ def run():
     parser.add_argument("--conf_thres", type=float, default=0.1, help="Evaluation: Object confidence threshold")
     parser.add_argument("--nms_thres", type=float, default=0.5, help="Evaluation: IOU threshold for non-maximum suppression")
     parser.add_argument("--logdir", type=str, default="logs", help="Directory for training log files (e.g. for TensorBoard)")
-    parser.add_argument("--seed", type=int, default=-1, help="Makes results reproducible. Set -1 to disable.")
+    parser.add_argument("--seed", type=int, default=-1, help="Makes results reproducable. Set -1 to disable.")
     args = parser.parse_args()
     print(f"Command line arguments: {args}")
 
@@ -79,18 +91,13 @@ def run():
     train_path = data_config["train"]
     valid_path = data_config["valid"]
     class_names = load_classes(data_config["names"])
-
-    # Set device to GPU if available
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
 
     # ############
     # Create model
     # ############
 
     model = load_model(args.model, args.pretrained_weights)
-    model.to(device)
-    print(next(model.parameters()).device)  # Confirm model is on GPU
 
     # Print model
     if args.verbose:
@@ -122,6 +129,7 @@ def run():
     # ################
 
     params = [p for p in model.parameters() if p.requires_grad]
+
     if (model.hyperparams['optimizer'] in [None, "adam"]):
         optimizer = optim.Adam(
             params,
@@ -137,40 +145,99 @@ def run():
     else:
         print("Unknown optimizer. Please choose between (adam, sgd).")
 
-    scaler = GradScaler()  # Initialize scaler for mixed precision
+    # skip epoch zero, because then the calculations for when to evaluate/checkpoint makes more intuitive sense
+    # e.g. when you stop after 30 epochs and evaluate every 10 epochs then the evaluations happen after: 10,20,30
+    # instead of: 0, 10, 20
+    for epoch in range(1, args.epochs+1):
 
-    for epoch in range(1, args.epochs + 1):
         print("\n---- Training Model ----")
+
         model.train()  # Set model to training mode
 
         for batch_i, (_, imgs, targets) in enumerate(tqdm.tqdm(dataloader, desc=f"Training Epoch {epoch}")):
             batches_done = len(dataloader) * epoch + batch_i
 
             imgs = imgs.to(device, non_blocking=True)
-            targets = targets.to(device, non_blocking=True)
+            targets = targets.to(device)
 
-            print(f"Imgs device: {imgs.device}")  # Debug
-            print(f"Targets device: {targets.device}")  # Debug
-
-        with autocast():  # Mixed precision
+            # sigma_conf = targets[-1] # Assuming sigma is at end of label
+            # new_lr = model.hyperparams['learning_rate'] * sigma_conf
+            #for param_group in optimizer.param_groups:
+            #   param_group['lr'] = new_lr  # Update the learning rate
             outputs = model(imgs)
+
             loss, loss_components = compute_loss(outputs, targets, model)
 
+            loss.backward()
 
-            scaler.scale(loss).backward()
+            ###############
+            # Run optimizer
+            ###############
 
             if batches_done % model.hyperparams['subdivisions'] == 0:
-                scaler.step(optimizer)
-                scaler.update()
+                # Adapt learning rate
+                # Get learning rate defined in cfg
+                lr = model.hyperparams['learning_rate']
+                if batches_done < model.hyperparams['burn_in']:
+                    # Burn in
+                    lr *= (batches_done / model.hyperparams['burn_in'])
+                else:
+                    # Set and parse the learning rate to the steps defined in the cfg
+                    for threshold, value in model.hyperparams['lr_steps']:
+                        if batches_done > threshold:
+                            lr *= value
+                # Log the learning rate
+                logger.scalar_summary("train/learning_rate", lr, batches_done)
+                # Set learning rate
+                for g in optimizer.param_groups:
+                    g['lr'] = lr
+
+                # Run optimizer
+                optimizer.step()
+                # Reset gradients
                 optimizer.zero_grad()
 
+            # ############
+            # Log progress
+            # ############
+            if args.verbose:
+                print(AsciiTable(
+                    [
+                        ["Type", "Value"],
+                        ["IoU loss", float(loss_components[0])],
+                        ["Object loss", float(loss_components[1])],
+                        ["Class loss", float(loss_components[2])],
+                        ["Loss", float(loss_components[3])],
+                        ["Batch loss", to_cpu(loss).item()],
+                    ]).table)
+
+            # Tensorboard logging
+            tensorboard_log = [
+                ("train/iou_loss", float(loss_components[0])),
+                ("train/obj_loss", float(loss_components[1])),
+                ("train/class_loss", float(loss_components[2])),
+                ("train/loss", to_cpu(loss).item())]
+            logger.list_of_scalars_summary(tensorboard_log, batches_done)
+
+            model.seen += imgs.size(0)
+
+        # #############
+        # Save progress
+        # #############
+
+        # Save model to checkpoint file
         if epoch % args.checkpoint_interval == 0:
             checkpoint_path = f"checkpoints/yolov3_ckpt_{epoch}.pth"
             print(f"---- Saving checkpoint to: '{checkpoint_path}' ----")
             torch.save(model.state_dict(), checkpoint_path)
 
+        # ########
+        # Evaluate
+        # ########
+
         if epoch % args.evaluation_interval == 0:
             print("\n---- Evaluating Model ----")
+            # Evaluate the model on the validation set
             metrics_output = _evaluate(
                 model,
                 validation_dataloader,
@@ -181,6 +248,7 @@ def run():
                 nms_thres=args.nms_thres,
                 verbose=args.verbose
             )
+
             if metrics_output is not None:
                 precision, recall, AP, f1, ap_class = metrics_output
                 evaluation_metrics = [
