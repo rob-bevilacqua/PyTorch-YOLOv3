@@ -128,7 +128,7 @@ In `data/custom/train.txt` and `data/custom/valid.txt`, add paths to images that
 To train on the custom dataset run:
 
 ```bash
-poetry run yolo-train --model config/yolov3-custom.cfg --data config/custom.data
+poetry run yolo-train --model config/yolov3-custom.cfg --data config/custom.data --pretrained_weights weights/darknet53.conv.74
 ```
 
 Add `--pretrained_weights weights/darknet53.conv.74` to train using a backend pretrained on ImageNet.
