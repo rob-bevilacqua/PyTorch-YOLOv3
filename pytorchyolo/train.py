@@ -6,6 +6,8 @@ import os
 import argparse
 import tqdm
 
+import numpy as np
+
 import torch
 from torch.utils.data import DataLoader
 import torch.optim as optim
@@ -19,6 +21,7 @@ from pytorchyolo.utils.augmentations import AUGMENTATION_TRANSFORMS
 from pytorchyolo.utils.parse_config import parse_data_config
 from pytorchyolo.utils.loss import compute_loss
 from pytorchyolo.test import _evaluate, _create_validation_data_loader
+
 
 from terminaltables import AsciiTable
 
@@ -74,11 +77,19 @@ def run():
     parser.add_argument("--nms_thres", type=float, default=0.5, help="Evaluation: IOU threshold for non-maximum suppression")
     parser.add_argument("--logdir", type=str, default="logs", help="Directory for training log files (e.g. for TensorBoard)")
     parser.add_argument("--seed", type=int, default=-1, help="Makes results reproducable. Set -1 to disable.")
+
+    parser.add_argument("--network_lr_mod", action="store_true", help="Enable learning rate confidence modification.") # Our addition
+
     args = parser.parse_args()
     print(f"Command line arguments: {args}")
 
+    # Access the flag directly via args
+    if args.network_lr_mod:  # Check if the flag was passed
+        print("=====Learning rate confidence modification is enabled =====")
+
     if args.seed != -1:
         provide_determinism(args.seed)
+    
 
     logger = Logger(args.logdir)  # Tensorboard logger
 
@@ -160,12 +171,13 @@ def run():
             imgs = imgs.to(device, non_blocking=True)
             targets = targets.to(device)
 
-            # sigma_conf = targets[-1] # Assuming sigma is at end of label
-            # new_lr = model.hyperparams['learning_rate'] * sigma_conf
-            #for param_group in optimizer.param_groups:
-            #   param_group['lr'] = new_lr  # Update the learning rate
+            if args.network_lr_mod: # IF THE FLAG WAS PASSED TO THE ARG PARSER
+                sigma_conf = targets[-1] # Assuming sigma is at end of label
+                new_lr = model.hyperparams['learning_rate'] * np.exp(-sigma_conf)
+                for param_group in optimizer.param_groups:
+                    param_group['lr'] = new_lr  # Update the learning rate
+            
             outputs = model(imgs)
-
             loss, loss_components = compute_loss(outputs, targets, model)
 
             loss.backward()
