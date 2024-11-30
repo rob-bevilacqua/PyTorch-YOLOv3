@@ -143,3 +143,105 @@ class ListDataset(Dataset):
 
     def __len__(self):
         return len(self.img_files)
+
+
+
+class TrainListDataset(Dataset):
+    def __init__(self, list_path, img_size=416, multiscale=True, transform=None):
+        with open(list_path, "r") as file:
+            self.img_files = file.readlines()
+
+        self.label_files = []
+        for path in self.img_files:
+            image_dir = os.path.dirname(path)
+            label_dir = "labels".join(image_dir.rsplit("images", 1))
+            assert label_dir != image_dir, \
+                f"Image path must contain a folder named 'images'! \n'{image_dir}'"
+            label_file = os.path.join(label_dir, os.path.basename(path))
+            label_file = os.path.splitext(label_file)[0] + '.txt'
+            self.label_files.append(label_file)
+
+        self.img_size = img_size
+        self.max_objects = 100
+        self.multiscale = multiscale
+        self.min_size = self.img_size - 3 * 32
+        self.max_size = self.img_size + 3 * 32
+        self.batch_count = 0
+        self.transform = transform
+
+    def __getitem__(self, index):
+
+        # ---------
+        #  Image
+        # ---------
+        try:
+
+            img_path = self.img_files[index % len(self.img_files)].rstrip()
+
+            img = np.array(Image.open(img_path).convert('RGB'), dtype=np.uint8)
+        except Exception:
+            print(f"Could not read image '{img_path}'.")
+            return
+
+        # ---------
+        #  Label
+        # ---------
+        try:
+            label_path = self.label_files[index % len(self.img_files)].rstrip()
+
+            # Ignore warning if file is empty
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                boxes = np.loadtxt(label_path).reshape(-1, 6) # Expect 6 columns now
+
+            
+            # Extract bounding box and sigma_conf
+            bb_targets = boxes[:, :-1]  # All columns except the last one
+            sigma_conf = boxes[:, -1]  # Only the last column
+
+            
+        except Exception:
+            print(f"Could not read label '{label_path}'.")
+            return
+
+        # -----------
+        #  Transform
+        # -----------
+        if self.transform:
+            try:
+                img, bb_targets = self.transform((img, bb_targets))
+            except Exception:
+                print("Could not apply transform.")
+                return
+
+        return img_path, img, bb_targets, sigma_conf # Return sigma_conf as well 
+
+    def collate_fn(self, batch):
+        self.batch_count += 1
+
+        # Drop invalid images
+        batch = [data for data in batch if data is not None]
+
+        # Unpack the batch, now including sigma_conf
+        paths, imgs, bb_targets, sigma_conf = list(zip(*batch))
+
+        # Selects new image size every tenth batch
+        if self.multiscale and self.batch_count % 10 == 0:
+            self.img_size = random.choice(
+                range(self.min_size, self.max_size + 1, 32))
+
+        # Resize images to input shape
+        imgs = torch.stack([resize(img, self.img_size) for img in imgs])
+
+        # Add sample index to targets
+        for i, boxes in enumerate(bb_targets):
+            boxes[:, 0] = i
+        bb_targets = torch.cat(bb_targets, 0)
+
+        # Concatenate sigma_conf values into a single tensor
+        sigma_conf = torch.cat([torch.tensor(s) for s in sigma_conf], 0)
+
+        return paths, imgs, bb_targets, sigma_conf
+
+    def __len__(self):
+        return len(self.img_files)

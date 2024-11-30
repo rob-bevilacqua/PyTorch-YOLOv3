@@ -15,7 +15,7 @@ import torch.optim as optim
 from pytorchyolo.models import load_model
 from pytorchyolo.utils.logger import Logger
 from pytorchyolo.utils.utils import to_cpu, load_classes, print_environment_info, provide_determinism, worker_seed_set
-from pytorchyolo.utils.datasets import ListDataset
+from pytorchyolo.utils.datasets import ListDataset, TrainListDataset
 from pytorchyolo.utils.augmentations import AUGMENTATION_TRANSFORMS
 #from pytorchyolo.utils.transforms import DEFAULT_TRANSFORMS
 from pytorchyolo.utils.parse_config import parse_data_config
@@ -44,7 +44,7 @@ def _create_data_loader(img_path, batch_size, img_size, n_cpu, multiscale_traini
     :return: Returns DataLoader
     :rtype: DataLoader
     """
-    dataset = ListDataset(
+    dataset = TrainListDataset(
         img_path,
         img_size=img_size,
         multiscale=multiscale_training,
@@ -78,14 +78,17 @@ def run():
     parser.add_argument("--logdir", type=str, default="logs", help="Directory for training log files (e.g. for TensorBoard)")
     parser.add_argument("--seed", type=int, default=-1, help="Makes results reproducable. Set -1 to disable.")
 
-    parser.add_argument("--network_lr_mod", action="store_true", help="Enable learning rate confidence modification.") # Our addition
+    parser.add_argument("--no_network_lr_mod", action="store_false", dest="network_lr_mod", help="Disable learning rate confidence modification (Default: enabled).") # Our addition
 
     args = parser.parse_args()
     print(f"Command line arguments: {args}")
 
     # Access the flag directly via args
     if args.network_lr_mod:  # Check if the flag was passed
-        print("=====Learning rate confidence modification is enabled =====")
+        print("\n=====Learning rate confidence modification is enabled =====")
+    else:
+        print("\n=====Learning rate confidence modification is disabled =====")
+
 
     if args.seed != -1:
         provide_determinism(args.seed)
@@ -141,20 +144,27 @@ def run():
 
     params = [p for p in model.parameters() if p.requires_grad]
 
-    if (model.hyperparams['optimizer'] in [None, "adam"]):
-        optimizer = optim.Adam(
-            params,
-            lr=model.hyperparams['learning_rate'],
-            weight_decay=model.hyperparams['decay'],
-        )
-    elif (model.hyperparams['optimizer'] == "sgd"):
-        optimizer = optim.SGD(
+    # if (model.hyperparams['optimizer'] in [None, "adam"]):
+    #     optimizer = optim.Adam(
+    #         params,
+    #         lr=model.hyperparams['learning_rate'],
+    #         weight_decay=model.hyperparams['decay'],
+    #     )
+    # elif (model.hyperparams['optimizer'] == "sgd"):
+    #     optimizer = optim.SGD(
+    #         params,
+    #         lr=model.hyperparams['learning_rate'],
+    #         weight_decay=model.hyperparams['decay'],
+    #         momentum=model.hyperparams['momentum'])
+    # else:
+    #     print("Unknown optimizer. Please choose between (adam, sgd).")
+
+    # User no longer gets a choice. There is only SGD.
+    optimizer = optim.SGD(     
             params,
             lr=model.hyperparams['learning_rate'],
             weight_decay=model.hyperparams['decay'],
             momentum=model.hyperparams['momentum'])
-    else:
-        print("Unknown optimizer. Please choose between (adam, sgd).")
 
     # skip epoch zero, because then the calculations for when to evaluate/checkpoint makes more intuitive sense
     # e.g. when you stop after 30 epochs and evaluate every 10 epochs then the evaluations happen after: 10,20,30
@@ -165,15 +175,16 @@ def run():
 
         model.train()  # Set model to training mode
 
-        for batch_i, (_, imgs, targets) in enumerate(tqdm.tqdm(dataloader, desc=f"Training Epoch {epoch}")):
+        for batch_i, (_, imgs, targets, confidences) in enumerate(tqdm.tqdm(dataloader, desc=f"Training Epoch {epoch}")):
             batches_done = len(dataloader) * epoch + batch_i
 
             imgs = imgs.to(device, non_blocking=True)
             targets = targets.to(device)
 
             if args.network_lr_mod: # IF THE FLAG WAS PASSED TO THE ARG PARSER
-                sigma_conf = targets[-1] # Assuming sigma is at end of label
-                new_lr = model.hyperparams['learning_rate'] * np.exp(-sigma_conf)
+                sigma_conf = confidences[0] # confidences is a batch of confidences. In our implementation, they are the same for all classes in an image.
+
+                new_lr = model.hyperparams['learning_rate'] * torch.exp(-sigma_conf) 
                 for param_group in optimizer.param_groups:
                     param_group['lr'] = new_lr  # Update the learning rate
             
